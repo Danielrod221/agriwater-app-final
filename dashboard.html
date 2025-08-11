@@ -1,449 +1,224 @@
-import os
-import psycopg2
-from psycopg2.extras import DictCursor
-from flask import Flask, render_template, request, redirect, url_for, session, flash
-from flask_bcrypt import Bcrypt
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
-from fpdf import FPDF
-from datetime import datetime, timedelta
-import stripe
-import requests
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body class="bg-slate-50 font-sans">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+        <div class="flex justify-between items-center mb-8">
+            <h1 class="text-4xl font-extrabold text-slate-900 tracking-tight">Dashboard</h1>
+            <a href="/marketplace" class="text-blue-600 hover:text-blue-800 font-medium transition-colors">&larr; Back to Marketplace</a>
+        </div>
 
-# --- App Configuration ---
-DATABASE_URL = os.environ.get('DATABASE_URL')
-SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY')
-STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY')
-SIGNWELL_API_KEY = os.environ.get('SIGNWELL_API_KEY')
-YOUR_DOMAIN = 'https://www.agriwatermarketplace.com'
-
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
-stripe.api_key = STRIPE_SECRET_KEY
-bcrypt = Bcrypt(app)
-
-UPLOAD_FOLDER = 'uploads'
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
-ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg'}
-
-# --- Helper Functions ---
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def get_db_connection():
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
-
-def send_email(to_email, subject, html_content):
-    message = Mail(from_email='support@agriwatermarketplace.com', to_emails=to_email, subject=subject, html_content=html_content)
-    try:
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        response = sg.send(message)
-        print(f"Email sent to {to_email}, Status Code: {response.status_code}")
-    except Exception as e:
-        print(f"Error sending email: {e}")
-
-def create_lease_agreement(listing, seller, buyer):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", 'B', 16)
-    pdf.cell(200, 10, txt="Temporary Water Lease Agreement", ln=True, align='C')
-    pdf.ln(10)
-    pdf.set_font("Arial", size=12)
-    today_date = datetime.now().strftime("%B %d, %Y")
-    pdf.multi_cell(0, 5, f"This agreement is made on {today_date} between the following parties:")
-    pdf.ln(5)
-    pdf.multi_cell(0, 5, f"SELLER: {seller['name']} ({seller['email']})")
-    pdf.multi_cell(0, 5, f"BUYER: {buyer['name']} ({buyer['email']})")
-    pdf.ln(10)
-    pdf.multi_cell(0, 5, f"The Seller agrees to lease and the Buyer agrees to receive the following water allocation for the duration of: {listing['lease_duration']}.")
-    pdf.ln(5)
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(40, 10, 'Water District:', 1); pdf.cell(0, 10, f" {listing['water_district']}", 1, ln=True)
-    pdf.cell(40, 10, 'Amount:', 1); pdf.cell(0, 10, f" {listing['amount_af']} Acre-Feet", 1, ln=True)
-    total_price = float(listing['price_per_af']) * float(listing['amount_af'])
-    pdf.cell(40, 10, 'Total Price:', 1); pdf.cell(0, 10, f" ${total_price:,.2f}", 1, ln=True)
-    pdf.ln(10)
-    pdf.set_font("Arial", size=12)
-    pdf.multi_cell(0, 5, "This agreement serves as a formal request to the specified water district to make the necessary ledger adjustments for this temporary transfer.")
-    pdf.ln(20)
-    pdf.cell(90, 10, "Seller Signature:", 0, 0); pdf.cell(90, 10, "Buyer Signature:", 0, 1)
-    pdf.ln(10)
-    pdf.cell(90, 10, "_________________________"); pdf.cell(90, 10, "_________________________")
-    return None
-
-def send_for_signature(pdf_path, seller, buyer):
-    if not pdf_path or not SIGNWELL_API_KEY:
-        print("PDF path not provided or SignWell API Key not set. Skipping signature.")
-        return False
-    
-    headers = {'X-Api-Key': SIGNWELL_API_KEY}
-    files = {'files[]': (os.path.basename(pdf_path), open(pdf_path, 'rb'), 'application/pdf')}
-    upload_url = "https://www.signwell.com/api/v1/document_templates/"
-    upload_response = requests.post(upload_url, headers=headers, files=files)
-    if upload_response.status_code != 201:
-        print(f"SignWell Upload Error: {upload_response.text}"); return False
-    template_id = upload_response.json()['id']
-    payload = {
-        "document_template_ids": [template_id],
-        "recipients": [{"email": seller['email'], "name": seller['name'], "role": "Seller"}, {"email": buyer['email'], "name": buyer['name'], "role": "Buyer"}],
-        "name": f"Water Lease Agreement - {seller['name']} & {buyer['name']}",
-        "subject": "Action Required: Sign Your Water Lease Agreement",
-        "message": "Please sign the attached water lease agreement to finalize your transaction on the Agri-Water Marketplace."
-    }
-    request_url = "https://www.signwell.com/api/v1/document_requests/"
-    request_response = requests.post(request_url, headers=headers, json=payload)
-    if request_response.status_code == 201:
-        print("Successfully sent document for signature via SignWell."); return True
-    else:
-        print(f"SignWell Request Error: {request_response.text}"); return False
-
-def get_success_lake_data():
-    """
-    Fetches the latest reservoir storage data for Success Lake from the CDEC API.
-    """
-    try:
-        today = datetime.now()
-        yesterday = today - timedelta(days=1)
-        start_date = yesterday.strftime('%Y-%m-%d')
-        end_date = today.strftime('%Y-%m-%d')
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="p-4 mb-4 text-sm rounded-lg border {% if category == 'error' %} bg-red-50 border-red-200 text-red-700 {% elif category == 'success' %} bg-green-50 border-green-200 text-green-700 {% else %} bg-blue-50 border-blue-200 text-blue-700 {% endif %}" role="alert">
+                {{ message }}
+              </div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
         
-        api_url = f"http://cdec.water.ca.gov/dynamicapp/req/JSONDataServlet?Stations=SUC&SensorNums=15&dur_code=D&Start={start_date}&End={end_date}"
-        
-        response = requests.get(api_url)
-        response.raise_for_status()
-        data = response.json()
+        {% if not stripe_account_is_active %}
+        <div class="bg-yellow-50 border-l-4 border-yellow-400 text-yellow-800 p-4 rounded-md mb-8" role="alert">
+            <p class="font-bold">Action Required</p>
+            <p>To list items for sale and receive payments, you must connect and fully activate your bank account via Stripe.</p>
+            <a href="/connect_stripe" class="mt-2 inline-block bg-yellow-400 text-white font-bold py-2 px-4 rounded hover:bg-yellow-500 transition-colors">Connect Account Now</a>
+        </div>
+        {% endif %}
 
-        # Print the raw data to the Heroku logs for debugging
-        print(f"CDEC API Response for Success Lake: {data}")
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
 
-        if data:
-            latest_reading = data[-1]
-            value = latest_reading.get('value')
-            
-            if value is not None and value > -9999:
-                return {
-                    "date": latest_reading.get('date'),
-                    "value": int(value)
+            <div class="lg:col-span-2 space-y-8">
+                <div class="bg-white border border-slate-200 rounded-lg shadow-sm p-6 transition hover:shadow-xl hover:-translate-y-1">
+                    <h2 class="text-xl font-semibold text-slate-800 mb-4">Water Balance Overview</h2>
+                    <div class="h-80 relative">
+                        <canvas id="balanceChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="bg-white border border-slate-200 rounded-lg shadow-sm">
+                    <div class="p-6 flex justify-between items-center border-b border-slate-200">
+                        <h2 class="text-xl font-semibold text-slate-800">My Listings</h2>
+                        <a href="/create_listing" class="bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700 transition-colors">+ New Listing</a>
+                    </div>
+                    <div>
+                        <ul class="divide-y divide-slate-200">
+                            {% for listing in my_listings %}
+                            <li class="p-4 hover:bg-slate-50 flex justify-between items-center">
+                                <div>
+                                    <p class="font-semibold text-slate-800">{{ listing.listing_type }} - {{ listing.amount_af }} AF at ${{ listing.price_per_af }}/AF</p>
+                                    <p class="text-sm text-slate-500">{{ listing.water_district }} | Duration: {{ listing.lease_duration }}</p>
+                                </div>
+                                <div class="flex items-center space-x-4">
+                                    <span class="px-3 py-1 text-xs font-medium rounded-full 
+                                        {% if listing.status == 'active' %} bg-green-100 text-green-800 
+                                        {% elif listing.status == 'sold' %} bg-blue-100 text-blue-800
+                                        {% else %} bg-yellow-100 text-yellow-800 {% endif %}">
+                                        {{ listing.status }}
+                                    </span>
+                                    {% if listing.status == 'active' %}
+                                    <a href="/edit_listing/{{ listing.id }}" class="text-sm font-medium text-blue-600 hover:text-blue-800 transition-colors">Edit</a>
+                                    <form action="/delete_listing/{{ listing.id }}" method="POST" onsubmit="return confirm('Are you sure you want to delete this listing?');">
+                                        <button type="submit" class="text-sm font-medium text-red-600 hover:text-red-800 transition-colors">Delete</button>
+                                    </form>
+                                    {% endif %}
+                                </div>
+                            </li>
+                            {% else %}
+                            <li class="p-6 text-center text-slate-500">You haven't created any listings yet.</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+            <div class="lg:col-span-1 space-y-8">
+                <div class="space-y-6">
+                    
+                    <div class="bg-white border border-slate-200 rounded-lg shadow-sm p-5 flex items-center transition hover:shadow-xl hover:-translate-y-1 group">
+                        <div class="bg-sky-100 rounded-full p-3 mr-4">
+                            <svg class="h-6 w-6 text-sky-600 transition-transform group-hover:scale-110" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M2.25 18.75a60.07 60.07 0 0115.797 2.101c.727.198 1.453-.342 1.453-1.096V18.75M3.75 4.5v.75A.75.75 0 013 6h-.75m0 0v-.75A.75.75 0 013 4.5h.75m0 0H21m-18 0h9.523M6 18v-5.841m1.5-1.5L9 9.75M15 12l-1.5-1.5m0 0l-1.5 1.5m1.5-1.5V18" /></svg>
+                        </div>
+                        <div>
+                            <p class="text-xs font-semibold text-slate-500 uppercase tracking-wider">SUCCESS LAKE LEVEL</p>
+                            {% if success_lake_info and success_lake_info.value is not none %}
+                                <p class="text-2xl font-bold text-sky-600">{{ "{:,.0f}".format(success_lake_info.value) }}<span class="text-lg font-medium text-slate-600"> AF</span></p>
+                                <p class="text-xs text-slate-500">As of {{ success_lake_info.date }}</p>
+                            {% else %}
+                                <p class="text-sm font-medium text-slate-500">Live data unavailable</p>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <div x-data="{ editing: false }" class="bg-white border border-slate-200 rounded-lg shadow-sm p-5 transition hover:shadow-xl hover:-translate-y-1 group">
+                        <div class="flex justify-between items-start">
+                            <div class="flex items-center">
+                                <div class="bg-blue-100 rounded-full p-3 mr-4">
+                                    <svg class="h-6 w-6 text-blue-600 transition-transform group-hover:scale-110" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" /></svg>                      
+                                </div>
+                                <div>
+                                    <p class="text-xs font-semibold text-slate-500 uppercase tracking-wider">YOUR AVAILABLE ALLOCATED WATER for 2025</p>
+                                    <p class="text-2xl font-bold text-slate-800">{{ "%.2f"|format(current_user.annual_allocation or 0) }} <span class="text-lg font-medium text-slate-600">AF</span></p>
+                                </div>
+                            </div>
+                            <button @click="editing = !editing" class="text-xs font-medium text-blue-600 hover:text-blue-800">Edit</button>
+                        </div>
+                        <form x-show="editing" x-transition class="mt-4 space-y-2" action="/set_allocation" method="POST">
+                            <label class="text-sm font-medium text-gray-700">Update Allocation (AF):</label>
+                            <input type="number" step="0.01" name="annual_allocation" value="{{ current_user.annual_allocation }}" required class="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500">
+                            <div class="flex justify-end space-x-2">
+                                <button @click.prevent="editing = false" type="button" class="bg-gray-200 text-gray-700 text-sm font-bold py-1 px-3 rounded-lg hover:bg-gray-300 transition">Cancel</button>
+                                <button type="submit" class="bg-blue-600 text-white text-sm font-bold py-1 px-3 rounded-lg hover:bg-blue-700 transition">Save</button>
+                            </div>
+                        </form>
+                    </div>
+                    
+                    <div class="bg-white border border-slate-200 rounded-lg shadow-sm p-5 flex items-center transition hover:shadow-xl hover:-translate-y-1 group">
+                        <div class="{% if (current_balance - current_user.annual_allocation) >= 0 %} bg-green-100 {% else %} bg-red-100 {% endif %} rounded-full p-3 mr-4">
+                            <svg class="h-6 w-6 transition-transform group-hover:scale-110 {% if (current_balance - current_user.annual_allocation) >= 0 %} text-green-600 {% else %} text-red-600 {% endif %}" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
+                        </div>
+                        <div>
+                            <p class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Net Traded</p>
+                            <p class="text-2xl font-bold {% if (current_balance - current_user.annual_allocation) >= 0 %} text-green-600 {% else %} text-red-600 {% endif %}">{{ "%+.2f"|format((current_balance or 0) - (current_user.annual_allocation or 0)) }} <span class="text-lg font-medium">AF</span></p>
+                        </div>
+                    </div>
+
+                    <div class="bg-white border border-slate-200 rounded-lg shadow-sm p-5 flex items-center transition hover:shadow-xl hover:-translate-y-1 group">
+                        <div class="bg-slate-100 rounded-full p-3 mr-4">
+                            <svg class="h-6 w-6 text-slate-600 transition-transform group-hover:scale-110" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a2.25 2.25 0 00-2.25-2.25H15a3 3 0 11-6 0H5.25A2.25 2.25 0 003 12m18 0v6a2.25 2.25 0 01-2.25-2.25H5.25A2.25 2.25 0 013 18v-6m18 0V9M3 12V9m18 3a2.25 2.25 0 00-2.25-2.25H15a3 3 0 11-6 0H5.25A2.25 2.25 0 003 12m15.75 6H5.25" /></svg>
+                        </div>
+                        <div>
+                            <p class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Current Balance</p>
+                            <p class="text-2xl font-bold text-blue-600">{{ "%.2f"|format(current_balance or 0) }} <span class="text-lg font-medium text-slate-600">AF</span></p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white border border-slate-200 rounded-lg shadow-sm p-6 space-y-4">
+                    <h2 class="text-xl font-semibold text-slate-800">Allocation Verification</h2>
+                    <div>
+                        <p class="font-medium text-slate-700">Status:</p>
+                        {% if current_user.allocation_status == 'verified' %}
+                            <span class="px-3 py-1 text-sm font-medium rounded-full bg-green-100 text-green-800">Verified</span>
+                        {% elif current_user.allocation_status == 'pending' %}
+                            <span class="px-3 py-1 text-sm font-medium rounded-full bg-yellow-100 text-yellow-800">Pending Review</span>
+                        {% else %}
+                            <span class="px-3 py-1 text-sm font-medium rounded-full bg-red-100 text-red-800">Unverified</span>
+                        {% endif %}
+                    </div>
+                    <form action="/upload_verification" method="POST" enctype="multipart/form-data" class="space-y-2">
+                        <input type="file" name="verification_doc" required class="text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"/>
+                        <button type="submit" class="w-full bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors text-sm">Upload Document</button>
+                    </form>
+                    {% if current_user.verification_doc %}
+                        <p class="text-xs text-slate-500 text-center">Current file: {{ current_user.verification_doc }}</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+      document.addEventListener('DOMContentLoaded', function() {
+        const ctx = document.getElementById('balanceChart');
+        if (ctx) {
+            // Safely get values from Jinja2 using the tojson filter
+            const annualAllocation = {{ current_user.annual_allocation|tojson }};
+            const currentBalance = {{ current_balance|tojson }};
+
+            // Perform math in pure JavaScript, handling cases where values might be null
+            const waterUsed = Math.max(0, (annualAllocation || 0) - (currentBalance || 0));
+            const waterRemaining = Math.max(0, currentBalance || 0);
+
+            new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Water Used/Sold (AF)', 'Water Remaining (AF)'],
+                    datasets: [{
+                        label: 'Water Balance',
+                        data: [waterUsed, waterRemaining],
+                        backgroundColor: ['#FCA5A5', '#60A5FA'],
+                        borderColor: ['#FFFFFF'],
+                        borderWidth: 4,
+                        hoverOffset: 8
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    cutout: '75%',
+                    plugins: {
+                        legend: {
+                            position: 'bottom'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    let label = context.label || '';
+                                    if (label) {
+                                        label += ': ';
+                                    }
+                                    if (context.parsed !== null) {
+                                        label += context.parsed.toFixed(2) + ' AF';
+                                    }
+                                    return label;
+                                }
+                            }
+                        }
+                    }
                 }
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching data from CDEC API for Success Lake: {e}")
-        return None
-
-# --- Route Definitions ---
-@app.route('/')
-def home():
-    return render_template('index.html')
-
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    if request.method == 'POST':
-        name = request.form['name']; email = request.form['email']; password = request.form['password']; phone = request.form['phone']; district = request.form['district']
-        hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
-        conn = get_db_connection(); cur = conn.cursor()
-        try:
-            cur.execute('INSERT INTO users (name, email, password_hash, phone_number, water_district) VALUES (%s, %s, %s, %s, %s) RETURNING id;', (name, email, hashed_password, phone, district))
-            new_user_id = cur.fetchone()[0]
-            conn.commit()
-        except psycopg2.IntegrityError:
-            flash('Email address already registered.', 'error'); cur.close(); conn.close(); return redirect(url_for('home') + '#signup')
-        cur.close(); conn.close()
-        session['user_id'] = new_user_id
-        subject = "Welcome to Agri-Water Marketplace!"; html_content = f"<strong>Hi {name},</strong><p>Thank you for joining AWM. You can now log in to get full access.</p>"
-        send_email(email, subject, html_content)
-        flash('Account created! Please log in to access the marketplace.', 'success')
-        return redirect(url_for('login'))
-    return render_template('index.html')
-
-@app.route('/login', methods=['POST'])
-def login():
-    email = request.form['email']; password = request.form['password']
-    conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute('SELECT * FROM users WHERE email = %s', (email,))
-    user = cur.fetchone()
-    cur.close(); conn.close()
-    if user and bcrypt.check_password_hash(user['password_hash'], password):
-        session['user_id'] = user['id']; session['user_name'] = user['name']
-        session['subscription_status'] = 'active'
-        session['stripe_account_id'] = user['stripe_account_id']
-        flash('Logged in successfully!', 'success'); return redirect(url_for('marketplace'))
-    else:
-        flash('Login failed. Check your email and password.', 'error'); return redirect(url_for('home') + '#signin')
-
-@app.route('/logout')
-def logout():
-    session.clear(); flash('You have been logged out.', 'success'); return redirect(url_for('home'))
-
-@app.route('/connect_stripe')
-def connect_stripe():
-    if 'user_id' not in session: return redirect(url_for('home') + '#signin')
-    return render_template('connect_stripe.html')
-
-@app.route('/stripe/authorize')
-def stripe_authorize():
-    if 'user_id' not in session: return redirect(url_for('home') + '#signin')
-    conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute('SELECT * FROM users WHERE id = %s', (session['user_id'],))
-    user = cur.fetchone()
-    account_id = user['stripe_account_id']
-    if not account_id:
-        try:
-            account = stripe.Account.create(type='standard', email=user['email'])
-            account_id = account.id
-            cur.execute('UPDATE users SET stripe_account_id = %s WHERE id = %s', (account_id, session['user_id'])); conn.commit()
-            session['stripe_account_id'] = account_id
-        except Exception as e:
-            flash(f'Could not create a Stripe account: {e}', 'error'); cur.close(); conn.close(); return redirect(url_for('dashboard'))
-    cur.close(); conn.close()
-    try:
-        account_link = stripe.AccountLink.create(account=account_id, refresh_url=YOUR_DOMAIN + '/stripe/authorize', return_url=YOUR_DOMAIN + '/stripe/return', type='account_onboarding')
-        return redirect(account_link.url, code=302)
-    except Exception as e:
-        flash(f'Could not connect to Stripe: {e}', 'error'); return redirect(url_for('dashboard'))
-
-@app.route('/stripe/return')
-def stripe_return():
-    flash('Your account has been connected to Stripe successfully!', 'success'); return redirect(url_for('dashboard'))
-
-@app.route('/marketplace')
-def marketplace():
-    if 'user_id' not in session:
-        flash('You must be logged in to access the marketplace.', 'error')
-        return redirect(url_for('home') + '#signin')
-    conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute('SELECT l.*, u.name as seller_name, u.allocation_status FROM listings l JOIN users u ON l.seller_id = u.id WHERE l.status = %s', ("active",))
-    listings = cur.fetchall()
-    cur.close(); conn.close()
-    return render_template('marketplace.html', listings=listings)
-
-@app.route('/create_listing', methods=['GET', 'POST'])
-def create_listing():
-    if 'user_id' not in session:
-        flash('You must be logged in to create a listing.', 'error')
-        return redirect(url_for('home') + '#signin')
-    conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute('SELECT stripe_account_id FROM users WHERE id = %s', (session['user_id'],))
-    user = cur.fetchone()
-    cur.close(); conn.close()
-    if not user['stripe_account_id']:
-        flash('You must connect a Stripe account before you can create listings.', 'error'); return redirect(url_for('connect_stripe'))
-
-    if request.method == 'POST':
-        listing_type = "Lease"
-        lease_duration = request.form['lease_duration']
-        water_district = request.form['water_district']
-        amount_af = request.form['amount_af']
-        price_per_af = request.form['price_per_af']
-        description = request.form.get('description', '')
-        seller_id = session['user_id']
-        
-        conn = get_db_connection(); cur = conn.cursor()
-        cur.execute(
-            'INSERT INTO listings (seller_id, listing_type, lease_duration, water_district, amount_af, price_per_af, description) VALUES (%s, %s, %s, %s, %s, %s, %s)',
-            (seller_id, listing_type, lease_duration, water_district, amount_af, price_per_af, description)
-        ); 
-        conn.commit()
-        cur.close(); conn.close()
-        flash('Your lease listing has been created successfully!', 'success'); return redirect(url_for('dashboard'))
-    return render_template('create_listing.html')
-
-@app.route('/dashboard')
-def dashboard():
-    if 'user_id' not in session: return redirect(url_for('home') + '#signin')
-    user_id = session['user_id']
-    conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute('SELECT * FROM users WHERE id = %s', (user_id,))
-    current_user = cur.fetchone()
-    cur.execute('SELECT * FROM listings WHERE seller_id = %s ORDER BY created_at DESC', (user_id,))
-    my_listings = cur.fetchall()
-    
-    stripe_account_is_active = False
-    if current_user and current_user['stripe_account_id']:
-        try:
-            stripe_account = stripe.Account.retrieve(current_user['stripe_account_id'])
-            if stripe_account.charges_enabled:
-                stripe_account_is_active = True
-        except Exception as e:
-            print(f"Could not retrieve Stripe account: {e}")
-            stripe_account_is_active = False
-
-    cur.execute('SELECT SUM(amount_af) as total FROM listings WHERE seller_id = %s AND status = %s', (user_id, 'sold'))
-    listings_sold_query = cur.fetchone()
-    total_sold = listings_sold_query['total'] if listings_sold_query['total'] is not None else 0
-    
-    cur.execute(
-        'SELECT SUM(l.amount_af) as total FROM listings l '
-        'WHERE l.status = %s AND EXISTS (SELECT 1 FROM offers WHERE offers.listing_id = l.id AND offers.buyer_id = %s AND offers.status = %s)',
-        ('sold', user_id, 'accepted')
-    )
-    listings_purchased_query = cur.fetchone()
-    total_purchased = listings_purchased_query['total'] if listings_purchased_query['total'] is not None else 0
-
-    current_balance = (current_user['annual_allocation'] or 0) - total_sold + total_purchased
-    
-    success_lake_info = get_success_lake_data()
-    
-    cur.close(); conn.close()
-    return render_template('dashboard.html', 
-                           my_listings=my_listings, 
-                           current_user=current_user, 
-                           current_balance=current_balance, 
-                           stripe_account_is_active=stripe_account_is_active,
-                           success_lake_info=success_lake_info)
-
-@app.route('/purchase/<int:listing_id>')
-def purchase(listing_id):
-    if 'user_id' not in session: flash('You must be logged in to purchase.', 'error'); return redirect(url_for('home') + '#signin')
-    buyer_id = session['user_id']
-    conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute('SELECT * FROM listings WHERE id = %s', (listing_id,))
-    listing = cur.fetchone()
-    if listing and listing['seller_id'] == buyer_id:
-        flash("You cannot purchase your own listing.", 'error'); cur.close(); conn.close(); return redirect(url_for('marketplace'))
-    
-    cur.execute('SELECT * FROM users WHERE id = %s', (listing['seller_id'],))
-    seller = cur.fetchone()
-    if not seller['stripe_account_id']:
-        flash('This seller has not yet set up to receive payments.', 'error'); cur.close(); conn.close(); return redirect(url_for('marketplace'))
-
-    try:
-        stripe_account = stripe.Account.retrieve(seller['stripe_account_id'])
-        if not stripe_account.charges_enabled:
-            flash('This seller has not completed their Stripe setup and cannot receive payments yet. Please try again later.', 'error')
-            cur.close(); conn.close(); return redirect(url_for('marketplace'))
-    except Exception as e:
-        flash(f'There was an issue verifying the seller\'s account: {e}', 'error'); cur.close(); conn.close(); return redirect(url_for('marketplace'))
-
-    try:
-        total_price = int(float(listing['price_per_af']) * float(listing['amount_af']) * 100)
-        application_fee = int(total_price * 0.035)
-        
-        checkout_session = stripe.checkout.Session.create(
-            line_items=[{'price_data': {'currency': 'usd', 'product_data': {'name': f"{listing['amount_af']} AF of water from {seller['name']}"}, 'unit_amount': total_price}, 'quantity': 1}],
-            mode='payment',
-            payment_intent_data={'application_fee_amount': application_fee, 'transfer_data': {'destination': seller['stripe_account_id']}},
-            success_url=YOUR_DOMAIN + f'/purchase_success/{listing_id}/{buyer_id}',
-            cancel_url=YOUR_DOMAIN + '/cancel',
-        )
-        cur.close(); conn.close()
-        return redirect(checkout_session.url, code=303)
-    except Exception as e:
-        flash(f'Could not process payment: {e}', 'error'); cur.close(); conn.close(); return redirect(url_for('marketplace'))
-
-@app.route('/purchase_success/<int:listing_id>/<int:buyer_id>')
-def purchase_success(listing_id, buyer_id):
-    conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute('SELECT * FROM listings WHERE id = %s', (listing_id,))
-    listing = cur.fetchone()
-    cur.execute('SELECT * FROM users WHERE id = %s', (listing['seller_id'],))
-    seller = cur.fetchone()
-    cur.execute('SELECT * FROM users WHERE id = %s', (buyer_id,))
-    buyer = cur.fetchone()
-    
-    cur.execute("UPDATE listings SET status = 'sold' WHERE id = %s", (listing_id,))
-    cur.execute('INSERT INTO offers (listing_id, buyer_id, status) VALUES (%s, %s, %s)', (listing_id, buyer_id, 'accepted'))
-    conn.commit()
-    
-    pdf_filename = create_lease_agreement(listing, seller, buyer)
-    send_for_signature(pdf_filename, seller, buyer)
-
-    if seller:
-        send_email(seller['email'], "You've been paid!", f"Congratulations, your listing for {listing['amount_af']} AF was purchased by {buyer['name']}. The lease agreement has been sent to both parties for signature.")
-    if buyer:
-        send_email(buyer['email'], "Purchase Successful!", f"Congratulations, you have successfully purchased the water listing from {seller['name']}. A lease agreement has been sent to you for signature.")
-    
-    cur.close(); conn.close()
-    flash('Purchase successful! The lease agreement has been sent to both parties for signature.', 'success')
-    return redirect(url_for('marketplace'))
-
-@app.route('/set_allocation', methods=['POST'])
-def set_allocation():
-    if 'user_id' not in session:
-        return redirect(url_for('home') + '#signin')
-    
-    allocation = request.form['annual_allocation']; user_id = session['user_id']
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute('UPDATE users SET annual_allocation = %s WHERE id = %s', (allocation, user_id))
-    conn.commit()
-    cur.close(); conn.close()
-    flash('Your annual allocation has been updated.', 'success')
-    return redirect(url_for('dashboard'))
-
-@app.route('/upload_verification', methods=['POST'])
-def upload_verification():
-    if 'user_id' not in session:
-        return redirect(url_for('home') + '#signin')
-    if 'verification_doc' not in request.files:
-        flash('No file part', 'error'); return redirect(url_for('dashboard'))
-    file = request.files['verification_doc']
-    if file.filename == '':
-        flash('No selected file', 'error'); return redirect(url_for('dashboard'))
-    if file and allowed_file(file.filename):
-        flash('Verification document uploaded. This feature is under development.', 'success')
-        return redirect(url_for('dashboard'))
-    else:
-        flash('File type not allowed.', 'error'); return redirect(url_for('dashboard'))
-
-@app.route('/edit_listing/<int:listing_id>', methods=['GET', 'POST'])
-def edit_listing(listing_id):
-    if 'user_id' not in session:
-        return redirect(url_for('home') + '#signin')
-
-    conn = get_db_connection(); cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute('SELECT * FROM listings WHERE id = %s AND seller_id = %s', (listing_id, session['user_id']))
-    listing = cur.fetchone()
-
-    if not listing:
-        flash('Listing not found or you do not have permission to edit it.', 'error')
-        cur.close(); conn.close()
-        return redirect(url_for('dashboard'))
-
-    if request.method == 'POST':
-        lease_duration = request.form['lease_duration']
-        water_district = request.form['water_district']
-        amount_af = request.form['amount_af']
-        price_per_af = request.form['price_per_af']
-        description = request.form.get('description', '')
-
-        cur.execute(
-            'UPDATE listings SET lease_duration = %s, water_district = %s, amount_af = %s, price_per_af = %s, description = %s WHERE id = %s',
-            (lease_duration, water_district, amount_af, price_per_af, description, listing_id)
-        )
-        conn.commit()
-        cur.close(); conn.close()
-        flash('Your listing has been updated successfully!', 'success')
-        return redirect(url_for('dashboard'))
-
-    cur.close(); conn.close()
-    return render_template('edit_listing.html', listing=listing)
-
-@app.route('/delete_listing/<int:listing_id>', methods=['POST'])
-def delete_listing(listing_id):
-    if 'user_id' not in session:
-        return redirect(url_for('home') + '#signin')
-
-    conn = get_db_connection(); cur = conn.cursor()
-    cur.execute('DELETE FROM listings WHERE id = %s AND seller_id = %s', (listing_id, session['user_id']))
-    conn.commit()
-    cur.close(); conn.close()
-    
-    flash('Your listing has been deleted.', 'success')
-    return redirect(url_for('dashboard'))
-
-@app.route('/how-it-works')
-def how_it_works():
-    return render_template('how_it_works.html')
-
-@app.route('/debug-env')
-def debug_env():
-    db_url = os.environ.get('DATABASE_URL')
-    if db_url:
-        parts = db_url.split('@')
-        hidden_url = parts[0].split(':')[0] + ':PASSWORD_HIDDEN@' + parts[1]
-        return f"SUCCESS: The DATABASE_URL is set. It looks like this: {hidden_url}"
-    else:
-        return "ERROR: The DATABASE_URL is NOT SET. The value is None."
+            });
+        }
+      });
+    </script>
+</body>
+</html>
